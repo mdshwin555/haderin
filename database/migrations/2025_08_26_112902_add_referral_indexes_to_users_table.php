@@ -5,53 +5,76 @@ use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Facades\DB;
 
-return new class extends Migration {
-
-    /** تحقّق بسيط لوجود فهرس باسم معيّن */
-    private function indexExists(string $table, string $indexName): bool
+return new class extends Migration
+{
+    private function isPgsql(): bool
     {
-        $rows = DB::select("SHOW INDEX FROM `{$table}` WHERE Key_name = ?", [$indexName]);
-        return !empty($rows);
+        return DB::getDriverName() === 'pgsql';
     }
 
     public function up(): void
     {
-        // احفظ حالة وجود الفهارس قبل إغلاق الـ closure
-        $hasReferralUnique = $this->indexExists('users', 'users_referral_code_unique');
-        $hasInvitedIndex   = $this->indexExists('users', 'users_invited_by_code_index');
-
-        Schema::table('users', function (Blueprint $table) use ($hasReferralUnique, $hasInvitedIndex) {
-            // أضف الأعمدة إن لم تكن موجودة
-            if (!Schema::hasColumn('users', 'referral_code')) {
+        // أضف الأعمدة إذا مش موجودة
+        if (!Schema::hasColumn('users', 'referral_code')) {
+            Schema::table('users', function (Blueprint $table) {
+                // ملاحظة: في PG ما في "after", فLaravel يتجاهلها تلقائياً
                 $table->string('referral_code', 16)->nullable()->after('status');
-            }
-            if (!Schema::hasColumn('users', 'invited_by_code')) {
+            });
+        }
+        if (!Schema::hasColumn('users', 'invited_by_code')) {
+            Schema::table('users', function (Blueprint $table) {
                 $table->string('invited_by_code', 16)->nullable()->after('referral_code');
+            });
+        }
+
+        if ($this->isPgsql()) {
+            // PostgreSQL: أسلم شيء نستعمل IF NOT EXISTS
+            DB::statement("CREATE UNIQUE INDEX IF NOT EXISTS users_referral_code_unique ON users (referral_code)");
+            DB::statement("CREATE INDEX IF NOT EXISTS users_invited_by_code_index ON users (invited_by_code)");
+        } else {
+            // MySQL/MariaDB: نفحص information_schema بدل SHOW INDEX
+            $exists = DB::selectOne("
+                SELECT 1
+                FROM information_schema.statistics
+                WHERE table_schema = DATABASE()
+                  AND table_name = 'users'
+                  AND index_name = 'users_referral_code_unique'
+            ");
+            if (!$exists) {
+                Schema::table('users', function (Blueprint $table) {
+                    $table->unique('referral_code', 'users_referral_code_unique');
+                });
             }
 
-            // أضف الفهارس فقط إذا غير موجودة
-            if (!$hasReferralUnique) {
-                $table->unique('referral_code', 'users_referral_code_unique');
+            $exists = DB::selectOne("
+                SELECT 1
+                FROM information_schema.statistics
+                WHERE table_schema = DATABASE()
+                  AND table_name = 'users'
+                  AND index_name = 'users_invited_by_code_index'
+            ");
+            if (!$exists) {
+                Schema::table('users', function (Blueprint $table) {
+                    $table->index('invited_by_code', 'users_invited_by_code_index');
+                });
             }
-            if (!$hasInvitedIndex) {
-                $table->index('invited_by_code', 'users_invited_by_code_index');
-            }
-        });
+        }
     }
 
     public function down(): void
     {
-        // إسقاط الفهارس فقط إذا كانت موجودة
-        if ($this->indexExists('users', 'users_referral_code_unique')) {
+        if ($this->isPgsql()) {
+            // في PG لازم تسقط الإندكس بدون ذكر الجدول
+            DB::statement("DROP INDEX IF EXISTS users_referral_code_unique");
+            DB::statement("DROP INDEX IF EXISTS users_invited_by_code_index");
+        } else {
+            // MySQL/MariaDB
             Schema::table('users', function (Blueprint $table) {
-                $table->dropUnique('users_referral_code_unique');
+                // هالدوال ما رح تفشل لو الإندكس مش موجود (معظم الإصدارات تتجاهل)
+                try { $table->dropUnique('users_referral_code_unique'); } catch (\Throwable $e) {}
+                try { $table->dropIndex('users_invited_by_code_index'); } catch (\Throwable $e) {}
             });
         }
-        if ($this->indexExists('users', 'users_invited_by_code_index')) {
-            Schema::table('users', function (Blueprint $table) {
-                $table->dropIndex('users_invited_by_code_index');
-            });
-        }
-        // ما رح نحذف الأعمدة حفاظاً على البيانات
+        // ما عم نحذف الأعمدة حفاظاً على البيانات
     }
 };
